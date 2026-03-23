@@ -353,7 +353,7 @@
     border-color: var(--green3);
     transform: translateY(-2px);
   }
-  .venft-img {
+  .venft-img-placeholder {
     width: 100%;
     height: 160px;
     background: linear-gradient(135deg, var(--bg3), var(--dim));
@@ -365,7 +365,7 @@
     position: relative;
     overflow: hidden;
   }
-  .venft-img::after {
+  .venft-img-placeholder::after {
     content: '';
     position: absolute;
     inset: 0;
@@ -375,6 +375,24 @@
       rgba(0,240,255,0.03) 100%
     );
   }
+  .venft-img-wrap {
+    width: 100%;
+    height: 160px;
+    overflow: hidden;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .venft-nft-img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+    transition: transform 0.3s ease;
+  }
+  .venft-card:hover .venft-nft-img { transform: scale(1.04); }
   .venft-body { padding: 18px; }
   .venft-id {
     font-family: var(--font-mono);
@@ -948,6 +966,7 @@ const DUSTLOCK_ABI = [
   'function ownerOf(uint256 tokenId) view returns (address)',
   'function balanceOf(address owner_) view returns (uint256)',
   'function totalLocked() view returns (uint256)',
+  'function tokenURI(uint256 tokenId) view returns (string)',
   'function earlyWithdrawPenalty() view returns (uint256)',
   'function minLockAmount() view returns (uint256)',
   'function DENOMINATOR() view returns (uint256)',
@@ -1188,16 +1207,49 @@ async function refreshMyNFTs() {
         const endDate   = new Date(lockEnd * 1000).toLocaleDateString();
         const vpFormatted = parseFloat(ethers.formatEther(vp)).toFixed(0);
 
+        // Fetch on-chain tokenURI and extract image
+        let imgHtml = '<div class="venft-img-placeholder">🔒</div>';
+        try {
+          const uri = await dl.tokenURI(tid);
+          if (uri) {
+            let imgSrc = '';
+            if (uri.startsWith('data:application/json;base64,')) {
+              // Standard base64 JSON metadata
+              const json = JSON.parse(atob(uri.replace('data:application/json;base64,', '')));
+              imgSrc = json.image || '';
+            } else if (uri.startsWith('data:application/json,')) {
+              // URL-encoded JSON metadata
+              const json = JSON.parse(decodeURIComponent(uri.replace('data:application/json,', '')));
+              imgSrc = json.image || '';
+            } else if (uri.startsWith('{')) {
+              // Raw JSON
+              const json = JSON.parse(uri);
+              imgSrc = json.image || '';
+            } else if (uri.startsWith('http') || uri.startsWith('ipfs')) {
+              // External URL — use as image src directly
+              imgSrc = uri.startsWith('ipfs://') ? uri.replace('ipfs://', 'https://ipfs.io/ipfs/') : uri;
+            } else if (uri.startsWith('data:image/')) {
+              // Direct image data URI
+              imgSrc = uri;
+            }
+            if (imgSrc) {
+              imgHtml = `<div class="venft-img-wrap"><img class="venft-nft-img" src="${imgSrc}" alt="veNFT #${tid}" onerror="this.parentElement.innerHTML='<div class=venft-img-placeholder>🔒</div>'"/></div>`;
+            }
+          }
+        } catch(uriErr) {
+          console.warn(`tokenURI fetch failed for #${tid}:`, uriErr);
+        }
+
         cards.push(`
           <div class="venft-card">
-            <div class="venft-img">🔒</div>
+            ${imgHtml}
             <div class="venft-body">
               <div class="venft-id">veNFT #${tid}</div>
               <div class="venft-amount">${parseFloat(amount).toLocaleString()} GOLDCOIN</div>
               <div class="venft-expiry">${expired ? '⚠ EXPIRED' : `Unlocks ${endDate}`}</div>
               <div class="venft-power">
                 <div class="power-bar-bg"><div class="power-bar-fill" style="width:${powerPct}%"></div></div>
-                <span class="power-label">${parseFloat(ethers.formatEther(vp)).toFixed(0)} VP</span>
+                <span class="power-label">${vpFormatted} VP</span>
               </div>
               <div class="venft-actions">
                 ${expired
