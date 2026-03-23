@@ -937,19 +937,25 @@ const ERC20_ABI = [
 ];
 
 const DUSTLOCK_ABI = [
-  'function lock(uint256 amount, uint256 duration) returns (uint256)',
+  'function lock(uint256 amount, uint256 duration) returns (uint256 tokenId)',
   'function withdraw(uint256 tokenId)',
   'function extendLock(uint256 tokenId, uint256 extraTime)',
-  'function increaseLockAmount(uint256 tokenId, uint256 amount)',
-  'function delegate(address to)',
-  'function delegates(address) view returns (address)',
-  'function votingPower(uint256 tokenId) view returns (uint256)',
+  'function increaseLock(uint256 tokenId, uint256 addAmount)',
+  'function getLock(uint256 tokenId) view returns (uint256 amount, uint256 lockStart, uint256 lockEnd, bool withdrawn)',
   'function locks(uint256 tokenId) view returns (uint256 amount, uint256 lockStart, uint256 lockEnd, bool withdrawn)',
+  'function votingPower(uint256 tokenId) view returns (uint256)',
+  'function totalVotingPower(address user) view returns (uint256 power)',
   'function ownerOf(uint256 tokenId) view returns (address)',
+  'function balanceOf(address owner_) view returns (uint256)',
   'function totalLocked() view returns (uint256)',
-  'function balanceOf(address) view returns (uint256)',
-  'function tokenOfOwnerByIndex(address,uint256) view returns (uint256)',
+  'function earlyWithdrawPenalty() view returns (uint256)',
+  'function minLockAmount() view returns (uint256)',
+  'function DENOMINATOR() view returns (uint256)',
+  'function MAX_LOCK() view returns (uint256)',
   'event LockCreated(address indexed user, uint256 indexed tokenId, uint256 amount, uint256 lockEnd)',
+  'event LockExtended(uint256 indexed tokenId, uint256 newLockEnd)',
+  'event LockIncreased(uint256 indexed tokenId, uint256 addedAmount)',
+  'event Withdrawn(uint256 indexed tokenId, address indexed to, uint256 amount, uint256 penalty)',
   'event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)',
 ];
 
@@ -1093,8 +1099,15 @@ async function refreshStats() {
       remaining > 0 ? `${days}d ${hours}h` : 'ENDED';
 
     if (account) {
-      const bal = await dl.balanceOf(account);
-      document.getElementById('statMyNFTs').textContent = bal.toString();
+      // Use myTokenIds.length for NFT count (no balanceOf enumerable needed)
+      document.getElementById('statMyNFTs').textContent = myTokenIds.length.toString();
+      // Show total voting power in stats
+      try {
+        const tvp = await dl.totalVotingPower(account);
+        const tvpFormatted = parseFloat(ethers.formatEther(tvp)).toFixed(0);
+        const el = document.getElementById('statMyNFTs');
+        if (el) el.title = `Total VP: ${tvpFormatted}`;
+      } catch(e) {}
     }
 
     // Rewards page epoch info
@@ -1128,45 +1141,52 @@ async function refreshMyNFTs() {
 
   try {
     const dl = getContract(CONFIG.DUSTLOCK, DUSTLOCK_ABI);
-    const bal = Number(await dl.balanceOf(account));
 
-    if (bal === 0) {
+    // Scan LockCreated events to find all tokenIds ever minted to this account
+    // (contract has no tokenOfOwnerByIndex, so events are the source of truth)
+    const filter = dl.filters.LockCreated(account);
+    const events = await dl.queryFilter(filter, -200000);
+    const candidates = [...new Set(events.map(e => Number(e.args[1])))];
+
+    // Also catch any transferred-in NFTs via Transfer events
+    const transferFilter = dl.filters.Transfer(null, account);
+    const transferEvents = await dl.queryFilter(transferFilter, -200000);
+    const transferred = transferEvents.map(e => Number(e.args[2]));
+    const allCandidates = [...new Set([...candidates, ...transferred])];
+
+    if (allCandidates.length === 0) {
       grid.innerHTML = '<div class="empty"><div class="empty-icon">💎</div><div class="empty-text">NO POSITIONS YET — LOCK TOKENS TO START</div></div>';
       myTokenIds = [];
       return;
     }
 
-    // Scan recent Transfer events to find tokenIds owned by this account
-    // (contract doesn't have enumerable, so we scan events)
-    const filter = dl.filters.Transfer(null, account);
-    const events = await dl.queryFilter(filter, -50000);
-    const candidates = [...new Set(events.map(e => Number(e.args[2])))];
-
     myTokenIds = [];
     const cards = [];
 
-    for (const tid of candidates) {
+    for (const tid of allCandidates) {
       try {
         const owner = await dl.ownerOf(tid);
         if (owner.toLowerCase() !== account.toLowerCase()) continue;
-        myTokenIds.push(tid);
 
         const [lockData, vp] = await Promise.all([
-          dl.locks(tid),
+          dl.getLock(tid),
           dl.votingPower(tid),
         ]);
 
         const amount    = ethers.formatEther(lockData[0]);
         const lockEnd   = Number(lockData[2]);
         const withdrawn = lockData[3];
+        if (withdrawn) continue;
+
+        myTokenIds.push(tid);
+
         const now       = Math.floor(Date.now()/1000);
         const expired   = now >= lockEnd;
         const maxLock   = 4 * 365 * 24 * 3600;
         const remaining = Math.max(0, lockEnd - now);
         const powerPct  = Math.round((remaining / maxLock) * 100);
         const endDate   = new Date(lockEnd * 1000).toLocaleDateString();
-
-        if (withdrawn) continue;
+        const vpFormatted = parseFloat(ethers.formatEther(vp)).toFixed(0);
 
         cards.push(`
           <div class="venft-card">
@@ -1423,7 +1443,7 @@ async function increaseLockAmount(tokenId) {
       await approveTx.wait();
     }
     toast('Adding tokens to lock...');
-    const tx = await dl.increaseLockAmount(tokenId, amountWei);
+    const tx = await dl.increaseLock(tokenId, amountWei);
     await tx.wait();
     toast(`Added ${amount} GOLDCOIN to veNFT #${tokenId} ✅`);
     await refreshAll();
@@ -1437,32 +1457,12 @@ async function increaseLockAmount(tokenId) {
 // ═══════════════════════════════════════════════════════════════
 async function delegateVotingPower() {
   if (!signer) return toast('Connect wallet first', 'warn');
-  const to = prompt('Delegate to address (or paste your own address to self-delegate):');
-  if (!to || !ethers.isAddress(to)) return toast('Invalid address', 'warn');
-  try {
-    const dl = getContract(CONFIG.DUSTLOCK, DUSTLOCK_ABI);
-    toast('Delegating voting power...');
-    const tx = await dl.delegate(to);
-    await tx.wait();
-    const label = to.toLowerCase() === account.toLowerCase() ? 'yourself' : `${to.slice(0,6)}...${to.slice(-4)}`;
-    toast(`Voting power delegated to ${label} ✅`);
-    refreshDelegateStatus();
-  } catch(e) {
-    toast(e.reason || e.message || 'Delegation failed', 'error');
-  }
+  toast('Delegation is not supported by this contract version', 'warn');
 }
 
 async function refreshDelegateStatus() {
-  if (!account || !provider) return;
-  try {
-    const dl = getContract(CONFIG.DUSTLOCK, DUSTLOCK_ABI);
-    const delegatee = await dl.delegates(account);
-    const el = document.getElementById('delegateStatus');
-    if (!el) return;
-    const isSelf = delegatee.toLowerCase() === account.toLowerCase() || delegatee === ethers.ZeroAddress;
-    el.textContent = isSelf ? 'Self (default)' : `${delegatee.slice(0,6)}...${delegatee.slice(-4)}`;
-    el.style.color = isSelf ? 'var(--muted)' : 'var(--magenta)';
-  } catch(e) { /* contract may not support delegates() */ }
+  const el = document.getElementById('delegateStatus');
+  if (el) { el.textContent = 'Not supported'; el.style.color = 'var(--muted)'; }
 }
 
 // ═══════════════════════════════════════════════════════════════
